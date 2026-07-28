@@ -24,6 +24,9 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()  # loads .env from the project root before anything else
+
 import httpx
 import requests
 from bs4 import BeautifulSoup
