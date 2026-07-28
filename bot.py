@@ -414,4 +414,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Python 3.10+ no longer auto-creates an event loop; 3.14 raises RuntimeError
+    # without one, so we create it explicitly before handing off to PTB.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     main()
