@@ -460,4 +460,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Python 3.10+ no longer auto-creates a default event loop.
+    # Python 3.14 raises RuntimeError in asyncio.get_event_loop() when none exists.
+    # python-telegram-bot calls get_event_loop() internally, so we must create
+    # and register one before handing control to PTB.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     main()
