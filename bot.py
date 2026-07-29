@@ -223,7 +223,7 @@ def run_agent(question: str, run_log: list) -> str:
         temperature=0.1,
     )
 
-    max_iterations = 2
+    max_iterations = 10
     for iteration in range(max_iterations):
         logger.info(f"Agent iteration {iteration}")
 
