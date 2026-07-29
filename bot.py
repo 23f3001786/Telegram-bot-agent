@@ -23,17 +23,19 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from the project root before anything else
 
-import httpx
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-import google.generativeai as genai
+# New google-genai SDK (pip install google-genai)
+from google import genai
+from google.genai import types as genai_types
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -45,14 +47,18 @@ logger = logging.getLogger("bot")
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GITHUB_TOKEN   = os.environ["GITHUB_TOKEN"]
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+GEMINI_API_KEY   = os.environ["GEMINI_API_KEY"]
+GITHUB_TOKEN     = os.environ["GITHUB_TOKEN"]
 CONVERSATION_TTL = int(os.environ.get("CONVERSATION_TTL", "300"))
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialise the new genai client
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ─── Tool definitions ────────────────────────────────────────────────────────
+# Thread pool for running sync work without blocking the async event loop
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# ─── Tool implementations ────────────────────────────────────────────────────
 
 def fetch_url(url: str, max_bytes: int = 200_000) -> str:
     """Download a URL and return its text content (HTML stripped to text)."""
@@ -81,7 +87,7 @@ def run_python(code: str) -> str:
     Execute Python code in a restricted namespace and return stdout + result.
     Available: pandas, requests, json, re, math, statistics, datetime, itertools.
     """
-    import io, contextlib, math, statistics, itertools
+    import io, contextlib, math, statistics, itertools, signal
     import pandas as pd
 
     namespace = {
@@ -109,45 +115,59 @@ def run_python(code: str) -> str:
         return f"EXCEPTION: {exc}"
 
 
-# ─── Gemini agent ────────────────────────────────────────────────────────────
+def dispatch_tool(name: str, args: dict) -> str:
+    if name == "fetch_url":
+        return fetch_url(**args)
+    if name == "run_python":
+        return run_python(**args)
+    return f"Unknown tool: {name}"
 
-TOOLS = [
-    {
-        "name": "fetch_url",
-        "description": (
-            "Fetch the text content of a public URL. "
-            "Use this to download datasets, MOSPI pages, Wikipedia, etc. "
-            "Returns plain text (HTML tags stripped)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "The URL to fetch."}
-            },
-            "required": ["url"],
+
+# ─── Tool declarations for Gemini ────────────────────────────────────────────
+
+FETCH_URL_DECL = genai_types.FunctionDeclaration(
+    name="fetch_url",
+    description=(
+        "Fetch the text content of a public URL. "
+        "Use this to download datasets, MOSPI pages, Wikipedia, CSV files, etc. "
+        "Returns plain text (HTML tags stripped). Max 50 000 chars."
+    ),
+    parameters=genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "url": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="The full URL to fetch.",
+            )
         },
-    },
-    {
-        "name": "run_python",
-        "description": (
-            "Execute Python code and return stdout. "
-            "pandas, requests, json, re, math, statistics, datetime are available. "
-            "Use this for data wrangling, calculations, and analysis. "
-            "Call fetch_url() inside the code if you need to download something. "
-            "Print your final answer clearly."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python source code to execute.",
-                }
-            },
-            "required": ["code"],
+        required=["url"],
+    ),
+)
+
+RUN_PYTHON_DECL = genai_types.FunctionDeclaration(
+    name="run_python",
+    description=(
+        "Execute Python code and return stdout. "
+        "pandas, requests, json, re, math, statistics, datetime, itertools are pre-imported. "
+        "fetch_url(url) is also available inside the code. "
+        "Use for data wrangling, CSV parsing, calculations, and analysis. "
+        "Always print your findings so they appear in the output."
+    ),
+    parameters=genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "code": genai_types.Schema(
+                type=genai_types.Type.STRING,
+                description="Python source code to execute.",
+            )
         },
-    },
-]
+        required=["code"],
+    ),
+)
+
+TOOLS = [genai_types.Tool(function_declarations=[FETCH_URL_DECL, RUN_PYTHON_DECL])]
+
+# ─── System prompt ───────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""
 You are an expert data analyst agent. You receive data-analysis questions—sometimes with
@@ -168,56 +188,60 @@ CRITICAL RULES:
 - Do NOT add explanation text outside the JSON.
 - If the question asks for a specific JSON shape for "answer", follow it precisely.
 - Use tools iteratively until you are confident in the answer.
-- For MOSPI data, try https://mospi.gov.in or search for the specific dataset.
-  Common datasets: SRS Statistical Reports, Health/MMR data, Census data, etc.
+- For MOSPI data: try https://mospi.gov.in and search for the specific dataset.
+  Common datasets: SRS Statistical Reports, Health/MMR data, Census data.
 - When fetching CSV/Excel data via run_python, use pd.read_csv() or pd.read_excel().
+- If a URL fails, try an alternative source (Wikipedia, data.gov.in, etc.).
 """).strip()
 
 
-def dispatch_tool(name: str, args: dict) -> str:
-    if name == "fetch_url":
-        return fetch_url(**args)
-    if name == "run_python":
-        return run_python(**args)
-    return f"Unknown tool: {name}"
-
+# ─── Gemini agent ────────────────────────────────────────────────────────────
 
 def run_agent(question: str, run_log: list) -> str:
     """
     Run the Gemini agent on `question`. Appends to run_log.
     Returns the final text response.
+    Uses the new google-genai SDK with proper multi-turn tool calling.
     """
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=SYSTEM_PROMPT,
-        tools=TOOLS,
-    )
-
     run_log.append({
         "event": "user_message",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "content": question,
     })
 
-    chat = model.start_chat(enable_automatic_function_calling=False)
+    # Build the initial conversation history
+    contents: list[genai_types.Content] = [
+        genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=question)],
+        )
+    ]
 
-    # Build messages from question
-    messages = [question]
+    config = genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=TOOLS,
+        temperature=0.1,
+    )
 
     max_iterations = 15
     for iteration in range(max_iterations):
         logger.info(f"Agent iteration {iteration}")
 
-        response = chat.send_message(messages[-1] if iteration == 0 else messages)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents,
+            config=config,
+        )
+
         candidate = response.candidates[0]
 
-        # Collect all parts
+        # Collect text parts and tool calls from the response
         text_parts = []
         tool_calls = []
         for part in candidate.content.parts:
-            if hasattr(part, "text") and part.text:
+            if part.text:
                 text_parts.append(part.text)
-            if hasattr(part, "function_call") and part.function_call:
+            if part.function_call:
                 fc = part.function_call
                 tool_calls.append({
                     "name": fc.name,
@@ -232,8 +256,11 @@ def run_agent(question: str, run_log: list) -> str:
             "tool_calls": tool_calls,
         })
 
+        # Append the model's turn to the conversation
+        contents.append(candidate.content)
+
         if not tool_calls:
-            # Final response
+            # No tool calls → this is the final answer
             final_text = "\n".join(text_parts).strip()
             run_log.append({
                 "event": "final_answer",
@@ -242,8 +269,8 @@ def run_agent(question: str, run_log: list) -> str:
             })
             return final_text
 
-        # Execute tools and feed results back
-        tool_results = []
+        # Execute tools and feed results back as a "tool" turn
+        tool_result_parts = []
         for tc in tool_calls:
             logger.info(f"Calling tool {tc['name']} with args {list(tc['args'].keys())}")
             result = dispatch_tool(tc["name"], tc["args"])
@@ -254,19 +281,28 @@ def run_agent(question: str, run_log: list) -> str:
                 "tool": tc["name"],
                 "result_preview": result[:500],
             })
-            tool_results.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
+            tool_result_parts.append(
+                genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
                         name=tc["name"],
                         response={"result": result},
                     )
                 )
             )
 
-        messages = [genai.protos.Content(parts=tool_results, role="tool")]
+        # Append tool results as a "user" turn (required by the new SDK)
+        contents.append(
+            genai_types.Content(
+                role="user",
+                parts=tool_result_parts,
+            )
+        )
 
-    # Max iterations hit – return whatever we have
-    run_log.append({"event": "max_iterations_reached", "timestamp": datetime.now(timezone.utc).isoformat()})
+    # Max iterations hit
+    run_log.append({
+        "event": "max_iterations_reached",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
     return '{"answer": "Could not complete analysis within iteration limit", "log_url": "__LOG_URL_PLACEHOLDER__"}'
 
 
@@ -275,7 +311,7 @@ def run_agent(question: str, run_log: list) -> str:
 def upload_gist(run_log: list) -> str:
     """Upload run_log as a public GitHub Gist and return the raw URL."""
     filename = f"run_{uuid.uuid4().hex[:8]}.jsonl"
-    content = "\n".join(json.dumps(entry) for entry in run_log)
+    content = "\n".join(json.dumps(entry, ensure_ascii=False) for entry in run_log)
     payload = {
         "description": "Data-analyst bot run log",
         "public": True,
@@ -285,13 +321,18 @@ def upload_gist(run_log: list) -> str:
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
     }
-    resp = requests.post("https://api.github.com/gists", json=payload, headers=headers, timeout=20)
+    resp = requests.post(
+        "https://api.github.com/gists",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
     resp.raise_for_status()
     data = resp.json()
-    raw_url = data["files"][filename]["raw_url"]
-    # Make URL permanent (not versioned)
     gist_id = data["id"]
-    permanent = f"https://gist.githubusercontent.com/{data['owner']['login']}/{gist_id}/raw/{filename}"
+    owner = data["owner"]["login"]
+    # Use the permanent (non-versioned) raw URL
+    permanent = f"https://gist.githubusercontent.com/{owner}/{gist_id}/raw/{filename}"
     logger.info(f"Gist uploaded: {permanent}")
     return permanent
 
@@ -343,12 +384,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Build prompt with conversation history
         prompt = get_conversation_context(chat_id, text)
 
-        # Run the agent
-        raw_answer = run_agent(prompt, run_log)
+        # Run the agent in a thread pool so we don't block the event loop
+        loop = asyncio.get_running_loop()
+        raw_answer = await loop.run_in_executor(
+            _executor, lambda: run_agent(prompt, run_log)
+        )
 
-        # Upload log to Gist
+        # Upload log to Gist (also in executor)
         try:
-            log_url = upload_gist(run_log)
+            log_url = await loop.run_in_executor(
+                _executor, lambda: upload_gist(run_log)
+            )
         except Exception as e:
             logger.error(f"Gist upload failed: {e}")
             log_url = "https://github.com/upload-failed"
@@ -414,8 +460,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Python 3.10+ no longer auto-creates an event loop; 3.14 raises RuntimeError
-    # without one, so we create it explicitly before handing off to PTB.
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     main()
