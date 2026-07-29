@@ -228,20 +228,56 @@ def run_agent(question: str, run_log: list) -> str:
         logger.info(f"Agent iteration {iteration}")
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=contents,
             config=config,
         )
 
+        if not response.candidates:
+            run_log.append({
+                "event": "error",
+                "iteration": iteration,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "note": "response.candidates is empty (fully blocked response)",
+            })
+            return '{"answer": "Response was blocked by safety filters", "log_url": "__LOG_URL_PLACEHOLDER__"}'
+
         candidate = response.candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        logger.info(f"Finish reason: {finish_reason}")
+
+        # candidate.content can be None when the response is blocked
+        # (SAFETY, RECITATION) or has no parts (some MAX_TOKENS cases).
+        if candidate.content is None:
+            # Try response.text as a last resort
+            fallback = ""
+            try:
+                fallback = response.text or ""
+            except Exception:
+                pass
+            run_log.append({
+                "event": "model_response",
+                "iteration": iteration,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": fallback,
+                "tool_calls": [],
+                "finish_reason": str(finish_reason),
+                "note": "candidate.content was None",
+            })
+            run_log.append({
+                "event": "final_answer",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "content": fallback,
+            })
+            return fallback or '{"answer": "No response from model", "log_url": "__LOG_URL_PLACEHOLDER__"}'
 
         # Collect text parts and tool calls from the response
         text_parts = []
         tool_calls = []
         for part in candidate.content.parts:
-            if part.text:
+            if getattr(part, "text", None):
                 text_parts.append(part.text)
-            if part.function_call:
+            if getattr(part, "function_call", None):
                 fc = part.function_call
                 tool_calls.append({
                     "name": fc.name,
@@ -254,6 +290,7 @@ def run_agent(question: str, run_log: list) -> str:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "text": "\n".join(text_parts),
             "tool_calls": tool_calls,
+            "finish_reason": str(finish_reason),
         })
 
         # Append the model's turn to the conversation
