@@ -223,12 +223,12 @@ def run_agent(question: str, run_log: list) -> str:
         temperature=0.1,
     )
 
-    max_iterations = 15
+    max_iterations = 2
     for iteration in range(max_iterations):
         logger.info(f"Agent iteration {iteration}")
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             contents=contents,
             config=config,
         )
