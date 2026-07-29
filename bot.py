@@ -228,7 +228,7 @@ def run_agent(question: str, run_log: list) -> str:
         logger.info(f"Agent iteration {iteration}")
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-flash-lite-latest",
             contents=contents,
             config=config,
         )
