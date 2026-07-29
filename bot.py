@@ -232,7 +232,7 @@ def run_agent(question: str, run_log: list) -> str:
             contents=contents,
             config=config,
         )
-
+#minor change
         if not response.candidates:
             run_log.append({
                 "event": "error",
